@@ -2,6 +2,8 @@ require 'timeout'
 
 class BlocksController < ApplicationController
 
+  respond_to :html, :json, :bin, :hex
+
   around_filter :timeout
 
   layout 'application'
@@ -22,21 +24,16 @@ class BlocksController < ApplicationController
     return render_error("Block #{params[:id]} not found.")  unless @block
     @siblings = STORE.db[:blk].where(depth: @block.depth).map {|b| STORE.get_block(b[:hash].hth) }
     @siblings.delete(@block)
-    respond_to do |format|
-      format.html { @page_title = "Block Details" }
-      format.json { render :text => @block.to_json }
-      format.bin { render :text => @block.to_payload }
-    end
+    @page_title = "Block Details"
+    respond_with(@block)
   end
 
   def tx
     @tx = STORE.get_tx(params[:id])
     return render_error("Tx #{params[:id]} not found.")  unless @tx
-    respond_to do |format|
-      format.html { @page_title = "Transaction Details" }
-      format.json { render :text => @tx.to_json }
-      format.bin { render :text => @tx.to_payload }
-    end
+    @blk = STORE.db[:blk][id: @tx.blk_id, chain: 0]
+    @page_title = "Transaction Details"
+    respond_with(@tx)
   end
 
   def address
@@ -49,7 +46,7 @@ class BlocksController < ApplicationController
     @addr_data = { address: @address, hash160: @hash160,
       tx_in_sz: 0, tx_out_sz: 0, btc_in: 0, btc_out: 0 }
 
-    @addr_txouts = STORE.db[:addr].where(hash160: @hash160.to_sequel_blob)
+    @addr_txouts = STORE.db[:addr].where(hash160: @hash160)
       .join(:addr_txout, addr_id: :id).join(:txout, id: :txout_id)
       .join(:tx, id: :tx_id).join(:blk_tx, tx_id: :id).join(:blk, id: :blk_id)
       .where(chain: 0).order(:depth)
@@ -67,22 +64,16 @@ class BlocksController < ApplicationController
     end
   end
 
-  def name
-    @name = params[:name]
-    @names = STORE.name_history(@name)
-    @current = @names.last
-    return render_error("Name #{@name} not found.")  unless @current
-  end
-
   caches_page :script
   def script
+    require 'method_source'
     tx_hash, txin_idx = params[:id].split(":")
     @tx = STORE.get_tx(tx_hash)
     @txin = @tx.in[txin_idx.to_i]
     @txout = @txin.get_prev_out
-    @script = Bitcoin::Script.new(@txin.script_sig + @txout.pk_script)
-    @result = @script.run do |pubkey, sig, hash_type|
-      hash = @tx.signature_hash_for_input(@txin.tx_idx, nil, @txout.pk_script)
+    @script = Bitcoin::Script.new(@txin.script_sig, @txout.pk_script)
+    @result = @script.run do |pubkey, sig, hash_type, subscript|
+      hash = @tx.signature_hash_for_input(@txin.tx_idx, subscript, hash_type)
       Bitcoin.verify_signature(hash, sig, pubkey.unpack("H*")[0])
     end
     @debug = @script.debug
@@ -94,7 +85,7 @@ class BlocksController < ApplicationController
     @limit = BB_CONFIG["script_list_limit"] || 10
     @offset = (params[:offset] || 0).to_i
     @count = STORE.db[:txout].where(type: type).count
-    @txouts = STORE.db[:txout].where(type: type).order(:id).limit(@limit, @offset)
+    @txouts = STORE.db[:txout].where(type: type).order(:id).reverse.limit(@limit, @offset)
   end
 
   # search for given (part of) block/tx/address.
@@ -140,6 +131,15 @@ class BlocksController < ApplicationController
     end
   end
 
+  def name
+    @name = params[:name]
+    @names = STORE.name_history(@name)
+    @current = @names.last
+    return render_error("Name #{@name} not found.")  unless @current
+    @page_title = "Name #{@name}"
+    respond_with(params[:history] ? @names : @current)
+  end
+
   def names
     @per_page = 20
     @page = (params[:page] || 1).to_i
@@ -181,16 +181,17 @@ class BlocksController < ApplicationController
         if @error
           res = { error: @error }
           res[:details] = @details  if @details
+          render(text: JSON.pretty_generate(res), status: :unprocessable_entity)
         else
-          res = @result
+          render(text: JSON.pretty_generate(@result))
         end
-        render(text: JSON.pretty_generate(res))
       end
       format.html
     end
   rescue Exception => ex
+    p $!; puts *$@
     respond_to do |format|
-      format.json { render(json: { error: $!.message }) }
+      format.json { render(json: { error: $!.message }, status: :internal_server_error) }
       format.html { @error = $! }
     end
   end
@@ -224,8 +225,9 @@ class BlocksController < ApplicationController
   def search_tx(part)
     # blob = ("%" + [part].pack("H*") + "%").to_sequel_blob
     # hash = STORE.db[:tx].filter(:hash.like(blob)).first[:hash].unpack("H*")[0]
-    hash = STORE.db[:tx][hash: part.htb.to_sequel_blob][:hash].hth
-    redirect_to tx_path(hash)
+    tx = STORE.db[:tx][hash: part.htb.blob]
+    tx ||= STORE.db[:tx][nhash: part.htb.blob]
+    redirect_to tx_path(tx[:hash].hth)
   rescue
     nil
   end
@@ -287,13 +289,13 @@ class BlocksController < ApplicationController
 
   def node_command cmd, *args
     s = TCPSocket.new(*BB_CONFIG["command"].split(":"))
-    s.write([cmd.to_s, args].to_json + "\x00")
+    s.write({id: 1, method: "relay_tx", params: args}.to_json + "\x00")
     buf = ""
     while b = s.read(1)
       break  if b == "\x00"
       buf << b
     end
-    res = JSON.parse(buf)[1]
+    JSON.parse(buf)["result"]
   end
 
 end
